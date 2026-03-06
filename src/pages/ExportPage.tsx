@@ -5382,12 +5382,6 @@ function ExportPage() {
           )}
           <div className="row-action-cell">
             <div className={`row-action-main ${hasRecentExport ? '' : 'single-line'}`.trim()}>
-              <button
-                className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
-                onClick={() => openSessionDetail(contact.username)}
-              >
-                详情
-              </button>
               <div className={`row-export-action-stack ${hasRecentExport ? '' : 'single-line'}`.trim()}>
                 <button
                   type="button"
@@ -5405,6 +5399,12 @@ function ExportPage() {
                 </button>
                 {hasRecentExport && <span className="row-export-time">{recentExportTime}</span>}
               </div>
+              <button
+                className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
+                onClick={() => openSessionDetail(contact.username)}
+              >
+                详情
+              </button>
             </div>
           </div>
         </div>
