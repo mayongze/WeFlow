@@ -1,5 +1,6 @@
 ﻿import { join, dirname, basename } from 'path'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, readFileSync } from 'fs'
+import { tmpdir } from 'os'
 
 // DLL 初始化错误信息，用于帮助用户诊断问题
 let lastDllInitError: string | null = null
@@ -60,6 +61,7 @@ export class WcdbCore {
   private currentPath: string | null = null
   private currentKey: string | null = null
   private currentWxid: string | null = null
+  private currentDbStoragePath: string | null = null
 
   // 函数引用
   private wcdbInitProtection: any = null
@@ -128,14 +130,17 @@ export class WcdbCore {
   private readonly avatarCacheTtlMs = 10 * 60 * 1000
   private logTimer: NodeJS.Timeout | null = null
   private lastLogTail: string | null = null
+  private lastResolvedLogPath: string | null = null
 
   setPaths(resourcesPath: string, userDataPath: string): void {
     this.resourcesPath = resourcesPath
     this.userDataPath = userDataPath
+    this.writeLog(`[bootstrap] setPaths resourcesPath=${resourcesPath} userDataPath=${userDataPath}`, true)
   }
 
   setLogEnabled(enabled: boolean): void {
     this.logEnabled = enabled
+    this.writeLog(`[bootstrap] setLogEnabled=${enabled ? '1' : '0'} env.WCDB_LOG_ENABLED=${process.env.WCDB_LOG_ENABLED || ''}`, true)
     if (this.isLogEnabled() && this.initialized) {
       this.startLogPolling()
     } else {
@@ -143,8 +148,13 @@ export class WcdbCore {
     }
   }
 
-  // 使用命名管道 IPC
+  // 使用命名管道 IPC (仅 Windows)
   startMonitor(callback: (type: string, json: string) => void): boolean {
+    if (process.platform !== 'win32') {
+      console.warn('[wcdbCore] Monitor not supported on macOS')
+      return false
+    }
+    
     if (!this.wcdbStartMonitorPipe) {
       return false
     }
@@ -251,9 +261,13 @@ export class WcdbCore {
 
 
   /**
-   * 获取 DLL 路径
+   * 获取库文件路径（跨平台）
    */
   private getDllPath(): string {
+    const isMac = process.platform === 'darwin'
+    const libName = isMac ? 'libwcdb_api.dylib' : 'wcdb_api.dll'
+    const subDir = isMac ? 'macos' : ''
+    
     const envDllPath = process.env.WCDB_DLL_PATH
     if (envDllPath && envDllPath.length > 0) {
       return envDllPath
@@ -265,22 +279,22 @@ export class WcdbCore {
 
     const candidates = [
       // 环境变量指定 resource 目录
-      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, 'wcdb_api.dll') : null,
+      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, subDir, libName) : null,
       // 显式 setPaths 设置的路径
-      this.resourcesPath ? join(this.resourcesPath, 'wcdb_api.dll') : null,
-      // text/resources/wcdb_api.dll (打包常见结构)
-      join(resourcesPath, 'resources', 'wcdb_api.dll'),
-      // items/resourcesPath/wcdb_api.dll (扁平结构)
-      join(resourcesPath, 'wcdb_api.dll'),
+      this.resourcesPath ? join(this.resourcesPath, subDir, libName) : null,
+      // resources/macos/libwcdb_api.dylib 或 resources/wcdb_api.dll
+      join(resourcesPath, 'resources', subDir, libName),
+      // resources/libwcdb_api.dylib 或 resources/wcdb_api.dll (扁平结构)
+      join(resourcesPath, subDir, libName),
       // CWD fallback
-      join(process.cwd(), 'resources', 'wcdb_api.dll')
+      join(process.cwd(), 'resources', subDir, libName)
     ].filter(Boolean) as string[]
 
     for (const path of candidates) {
       if (existsSync(path)) return path
     }
 
-    return candidates[0] || 'wcdb_api.dll'
+    return candidates[0] || libName
   }
 
   private isLogEnabled(): boolean {
@@ -292,14 +306,97 @@ export class WcdbCore {
   private writeLog(message: string, force = false): void {
     if (!force && !this.isLogEnabled()) return
     const line = `[${new Date().toISOString()}] ${message}`
-    // 同时输出到控制台和文件
 
+    const candidates: string[] = []
+    if (this.userDataPath) candidates.push(join(this.userDataPath, 'logs', 'wcdb.log'))
+    if (process.env.WCDB_LOG_DIR) candidates.push(join(process.env.WCDB_LOG_DIR, 'logs', 'wcdb.log'))
+    candidates.push(join(process.cwd(), 'logs', 'wcdb.log'))
+    candidates.push(join(tmpdir(), 'weflow-wcdb.log'))
+
+    const uniq = Array.from(new Set(candidates))
+    for (const filePath of uniq) {
+      try {
+        const dir = dirname(filePath)
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+        appendFileSync(filePath, line + '\n', { encoding: 'utf8' })
+        this.lastResolvedLogPath = filePath
+        return
+      } catch (e) {
+        console.error(`[wcdbCore] writeLog failed path=${filePath}:`, e)
+      }
+    }
+
+    console.error('[wcdbCore] writeLog failed for all candidates:', uniq.join(' | '))
+  }
+
+  private formatSqlForLog(sql: string, maxLen = 240): string {
+    const compact = String(sql || '').replace(/\s+/g, ' ').trim()
+    if (compact.length <= maxLen) return compact
+    return compact.slice(0, maxLen) + '...'
+  }
+
+  private async dumpDbStatus(tag: string): Promise<void> {
     try {
-      const base = this.userDataPath || process.env.WCDB_LOG_DIR || process.cwd()
-      const dir = join(base, 'logs')
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      appendFileSync(join(dir, 'wcdb.log'), line + '\n', { encoding: 'utf8' })
-    } catch { }
+      if (!this.ensureReady()) {
+        this.writeLog(`[diag:${tag}] db_status skipped: not connected`, true)
+        return
+      }
+      if (!this.wcdbGetDbStatus) {
+        this.writeLog(`[diag:${tag}] db_status skipped: api not supported`, true)
+        return
+      }
+      const outPtr = [null as any]
+      const rc = this.wcdbGetDbStatus(this.handle, outPtr)
+      if (rc !== 0 || !outPtr[0]) {
+        this.writeLog(`[diag:${tag}] db_status failed rc=${rc} outPtr=${outPtr[0] ? 'set' : 'null'}`, true)
+        return
+      }
+      const jsonStr = this.decodeJsonPtr(outPtr[0])
+      if (!jsonStr) {
+        this.writeLog(`[diag:${tag}] db_status decode failed`, true)
+        return
+      }
+      this.writeLog(`[diag:${tag}] db_status=${jsonStr}`, true)
+    } catch (e) {
+      this.writeLog(`[diag:${tag}] db_status exception: ${String(e)}`, true)
+    }
+  }
+
+  private async runPostOpenDiagnostics(dbPath: string, dbStoragePath: string | null, sessionDbPath: string | null, wxid: string): Promise<void> {
+    try {
+      this.writeLog(`[diag:open] input dbPath=${dbPath} wxid=${wxid}`, true)
+      this.writeLog(`[diag:open] resolved dbStorage=${dbStoragePath || 'null'}`, true)
+      this.writeLog(`[diag:open] resolved sessionDb=${sessionDbPath || 'null'}`, true)
+      if (!dbStoragePath) return
+      try {
+        const entries = readdirSync(dbStoragePath)
+        const sample = entries.slice(0, 20).join(',')
+        this.writeLog(`[diag:open] dbStorage entries(${entries.length}) sample=${sample}`, true)
+      } catch (e) {
+        this.writeLog(`[diag:open] list dbStorage failed: ${String(e)}`, true)
+      }
+
+      const contactProbe = await this.execQuery(
+        'contact',
+        null,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 50"
+      )
+      if (contactProbe.success) {
+        const names = (contactProbe.rows || []).map((r: any) => String(r?.name || '')).filter(Boolean)
+        this.writeLog(`[diag:open] contact sqlite_master rows=${names.length} names=${names.join(',')}`, true)
+      } else {
+        this.writeLog(`[diag:open] contact sqlite_master failed: ${contactProbe.error || 'unknown'}`, true)
+      }
+
+      const contactCount = await this.execQuery('contact', null, 'SELECT COUNT(1) AS cnt FROM contact')
+      if (contactCount.success && Array.isArray(contactCount.rows) && contactCount.rows.length > 0) {
+        this.writeLog(`[diag:open] contact count=${String((contactCount.rows[0] as any)?.cnt ?? '')}`, true)
+      } else {
+        this.writeLog(`[diag:open] contact count failed: ${contactCount.error || 'unknown'}`, true)
+      }
+    } catch (e) {
+      this.writeLog(`[diag:open] post-open diagnostics exception: ${String(e)}`, true)
+    }
   }
 
   /**
@@ -376,6 +473,51 @@ export class WcdbCore {
     return null
   }
 
+  private isRealDbFileName(name: string): boolean {
+    const lower = String(name || '').toLowerCase()
+    if (!lower.endsWith('.db')) return false
+    if (lower.endsWith('.db-shm')) return false
+    if (lower.endsWith('.db-wal')) return false
+    if (lower.endsWith('.db-journal')) return false
+    return true
+  }
+
+  private resolveContactDbPath(): string | null {
+    const dbStorage = this.currentDbStoragePath || this.resolveDbStoragePath(this.currentPath || '', this.currentWxid || '')
+    if (!dbStorage) return null
+    const contactDir = join(dbStorage, 'Contact')
+    if (!existsSync(contactDir)) return null
+
+    const preferred = [
+      join(contactDir, 'contact.db'),
+      join(contactDir, 'Contact.db')
+    ]
+    for (const p of preferred) {
+      if (existsSync(p)) return p
+    }
+
+    try {
+      const entries = readdirSync(contactDir)
+      const cands = entries
+        .filter((name) => this.isRealDbFileName(name))
+        .map((name) => join(contactDir, name))
+      if (cands.length > 0) return cands[0]
+    } catch { }
+    return null
+  }
+
+  private pickFirstStringField(row: Record<string, any>, candidates: string[]): string {
+    for (const key of candidates) {
+      const v = row[key]
+      if (typeof v === 'string' && v.trim()) return v
+      if (v !== null && v !== undefined) {
+        const s = String(v).trim()
+        if (s) return s
+      }
+    }
+    return ''
+  }
+
   /**
    * 初始化 WCDB
    */
@@ -385,31 +527,49 @@ export class WcdbCore {
     try {
       this.koffi = require('koffi')
       const dllPath = this.getDllPath()
+      this.writeLog(`[bootstrap] initialize platform=${process.platform} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
 
       if (!existsSync(dllPath)) {
         console.error('WCDB DLL 不存在:', dllPath)
+        this.writeLog(`[bootstrap] initialize failed: dll not found path=${dllPath}`, true)
         return false
       }
 
       const dllDir = dirname(dllPath)
-      const wcdbCorePath = join(dllDir, 'WCDB.dll')
-      if (existsSync(wcdbCorePath)) {
-        try {
-          this.koffi.load(wcdbCorePath)
-          this.writeLog('预加载 WCDB.dll 成功')
-        } catch (e) {
-          console.warn('预加载 WCDB.dll 失败(可能不是致命的):', e)
-          this.writeLog(`预加载 WCDB.dll 失败: ${String(e)}`)
+      const isMac = process.platform === 'darwin'
+      
+      // 预加载依赖库
+      if (isMac) {
+        const wcdbCorePath = join(dllDir, 'libWCDB.dylib')
+        if (existsSync(wcdbCorePath)) {
+          try {
+            this.koffi.load(wcdbCorePath)
+            this.writeLog('预加载 libWCDB.dylib 成功')
+          } catch (e) {
+            console.warn('预加载 libWCDB.dylib 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 libWCDB.dylib 失败: ${String(e)}`)
+          }
         }
-      }
-      const sdl2Path = join(dllDir, 'SDL2.dll')
-      if (existsSync(sdl2Path)) {
-        try {
-          this.koffi.load(sdl2Path)
-          this.writeLog('预加载 SDL2.dll 成功')
-        } catch (e) {
-          console.warn('预加载 SDL2.dll 失败(可能不是致命的):', e)
-          this.writeLog(`预加载 SDL2.dll 失败: ${String(e)}`)
+      } else {
+        const wcdbCorePath = join(dllDir, 'WCDB.dll')
+        if (existsSync(wcdbCorePath)) {
+          try {
+            this.koffi.load(wcdbCorePath)
+            this.writeLog('预加载 WCDB.dll 成功')
+          } catch (e) {
+            console.warn('预加载 WCDB.dll 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 WCDB.dll 失败: ${String(e)}`)
+          }
+        }
+        const sdl2Path = join(dllDir, 'SDL2.dll')
+        if (existsSync(sdl2Path)) {
+          try {
+            this.koffi.load(sdl2Path)
+            this.writeLog('预加载 SDL2.dll 成功')
+          } catch (e) {
+            console.warn('预加载 SDL2.dll 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 SDL2.dll 失败: ${String(e)}`)
+          }
         }
       }
 
@@ -982,7 +1142,7 @@ export class WcdbCore {
       }
 
       const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid)
-      this.writeLog(`open dbPath=${dbPath} wxid=${wxid} dbStorage=${dbStoragePath || 'null'}`)
+      this.writeLog(`open dbPath=${dbPath} wxid=${wxid} dbStorage=${dbStoragePath || 'null'}`, true)
 
       if (!dbStoragePath || !existsSync(dbStoragePath)) {
         console.error('数据库目录不存在:', dbPath)
@@ -991,7 +1151,7 @@ export class WcdbCore {
       }
 
       const sessionDbPath = this.findSessionDb(dbStoragePath)
-      this.writeLog(`open sessionDb=${sessionDbPath || 'null'}`)
+      this.writeLog(`open sessionDb=${sessionDbPath || 'null'}`, true)
       if (!sessionDbPath) {
         console.error('未找到 session.db 文件')
         this.writeLog('open failed: session.db not found')
@@ -1017,6 +1177,7 @@ export class WcdbCore {
       this.currentPath = dbPath
       this.currentKey = hexKey
       this.currentWxid = wxid
+      this.currentDbStoragePath = dbStoragePath
       this.initialized = true
       if (this.wcdbSetMyWxid && wxid) {
         try {
@@ -1028,7 +1189,9 @@ export class WcdbCore {
       if (this.isLogEnabled()) {
         this.startLogPolling()
       }
-      this.writeLog(`open ok handle=${handle}`)
+      this.writeLog(`open ok handle=${handle}`, true)
+      await this.dumpDbStatus('open')
+      await this.runPostOpenDiagnostics(dbPath, dbStoragePath, sessionDbPath, wxid)
       return true
     } catch (e) {
       console.error('打开数据库异常:', e)
@@ -1053,6 +1216,7 @@ export class WcdbCore {
       this.currentPath = null
       this.currentKey = null
       this.currentWxid = null
+      this.currentDbStoragePath = null
       this.initialized = false
       this.stopLogPolling()
     }
@@ -1208,6 +1372,31 @@ export class WcdbCore {
     }
     if (usernames.length === 0) return { success: true, map: {} }
     try {
+      if (process.platform === 'darwin') {
+        const uniq = Array.from(new Set(usernames.map((x) => String(x || '').trim()).filter(Boolean)))
+        if (uniq.length === 0) return { success: true, map: {} }
+        const inList = uniq.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
+        const sql = `SELECT * FROM contact WHERE username IN (${inList})`
+        const q = await this.execQuery('contact', null, sql)
+        if (!q.success) return { success: false, error: q.error || '获取昵称失败' }
+        const map: Record<string, string> = {}
+        for (const row of (q.rows || []) as Array<Record<string, any>>) {
+          const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
+          if (!username) continue
+          const display = this.pickFirstStringField(row, [
+            'remark', 'Remark',
+            'nick_name', 'nickName', 'nickname', 'NickName',
+            'alias', 'Alias'
+          ]) || username
+          map[username] = display
+        }
+        // 保证每个请求用户名至少有回退值
+        for (const u of uniq) {
+          if (!map[u]) map[u] = u
+        }
+        return { success: true, map }
+      }
+
       // 让出控制权，避免阻塞事件循环
       await new Promise(resolve => setImmediate(resolve))
 
@@ -1253,6 +1442,34 @@ export class WcdbCore {
       }
 
       if (toFetch.length === 0) {
+        return { success: true, map: resultMap }
+      }
+
+      if (process.platform === 'darwin') {
+        const inList = toFetch.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
+        const sql = `SELECT * FROM contact WHERE username IN (${inList})`
+        const q = await this.execQuery('contact', null, sql)
+        if (!q.success) {
+          if (Object.keys(resultMap).length > 0) {
+            return { success: true, map: resultMap, error: q.error || '获取头像失败' }
+          }
+          return { success: false, error: q.error || '获取头像失败' }
+        }
+
+        for (const row of (q.rows || []) as Array<Record<string, any>>) {
+          const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
+          if (!username) continue
+          const url = this.pickFirstStringField(row, [
+            'big_head_img_url', 'bigHeadImgUrl', 'bigHeadUrl', 'big_head_url',
+            'small_head_img_url', 'smallHeadImgUrl', 'smallHeadUrl', 'small_head_url',
+            'head_img_url', 'headImgUrl',
+            'avatar_url', 'avatarUrl'
+          ])
+          if (url) {
+            resultMap[username] = url
+            this.avatarUrlCache.set(username, { url, updatedAt: now })
+          }
+        }
         return { success: true, map: resultMap }
       }
 
@@ -1464,10 +1681,42 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     try {
+      if (process.platform === 'darwin') {
+        const safe = String(username || '').replace(/'/g, "''")
+        const sql = `SELECT * FROM contact WHERE username='${safe}' LIMIT 1`
+        const q = await this.execQuery('contact', null, sql)
+        if (!q.success) {
+          return { success: false, error: q.error || '获取联系人失败' }
+        }
+        const row = Array.isArray(q.rows) && q.rows.length > 0 ? q.rows[0] : null
+        if (!row) {
+          return { success: false, error: `联系人不存在: ${username}` }
+        }
+        return { success: true, contact: row }
+      }
+
       const outPtr = [null as any]
       const result = this.wcdbGetContact(this.handle, username, outPtr)
       if (result !== 0 || !outPtr[0]) {
-        return { success: false, error: `获取联系人失败: ${result}` }
+        this.writeLog(`[diag:getContact] primary api failed username=${username} code=${result} outPtr=${outPtr[0] ? 'set' : 'null'}`, true)
+        await this.dumpDbStatus('getContact-primary-fail')
+        await this.printLogs(true)
+
+        // Fallback: 直接查询 contact 表，便于区分是接口失败还是 contact 库本身不可读。
+        const safe = String(username || '').replace(/'/g, "''")
+        const fallbackSql = `SELECT * FROM contact WHERE username='${safe}' LIMIT 1`
+        const fallback = await this.execQuery('contact', null, fallbackSql)
+        if (fallback.success) {
+          const row = Array.isArray(fallback.rows) ? fallback.rows[0] : null
+          if (row) {
+            this.writeLog(`[diag:getContact] fallback sql hit username=${username}`, true)
+            return { success: true, contact: row }
+          }
+          this.writeLog(`[diag:getContact] fallback sql no row username=${username}`, true)
+          return { success: false, error: `联系人不存在: ${username}` }
+        }
+        this.writeLog(`[diag:getContact] fallback sql failed username=${username} err=${fallback.error || 'unknown'}`, true)
+        return { success: false, error: `获取联系人失败: ${result}; fallback=${fallback.error || 'unknown'}` }
       }
       const jsonStr = this.decodeJsonPtr(outPtr[0])
       if (!jsonStr) return { success: false, error: '解析联系人失败' }
@@ -1804,16 +2053,43 @@ export class WcdbCore {
         console.warn('[wcdbCore] execQuery: 参数化查询暂未在 C++ 层实现，将使用原始 SQL（可能存在注入风险）')
       }
       
+      const normalizedKind = String(kind || '').toLowerCase()
+      const isContactQuery = normalizedKind === 'contact' || /\bfrom\s+contact\b/i.test(String(sql))
+      let effectivePath = path || ''
+      if (normalizedKind === 'contact' && !effectivePath) {
+        const resolvedContactDb = this.resolveContactDbPath()
+        if (resolvedContactDb) {
+          effectivePath = resolvedContactDb
+          this.writeLog(`[diag:execQuery] contact path override -> ${effectivePath}`, true)
+        } else {
+          this.writeLog('[diag:execQuery] contact path override miss: Contact/contact.db not found', true)
+        }
+      }
+
       const outPtr = [null as any]
-      const result = this.wcdbExecQuery(this.handle, kind, path || '', sql, outPtr)
+      const result = this.wcdbExecQuery(this.handle, kind, effectivePath, sql, outPtr)
       if (result !== 0 || !outPtr[0]) {
+        if (isContactQuery) {
+          this.writeLog(`[diag:execQuery] contact query failed code=${result} kind=${kind} path=${effectivePath} sql="${this.formatSqlForLog(sql)}"`, true)
+          await this.dumpDbStatus('execQuery-contact-fail')
+          await this.printLogs(true)
+        }
         return { success: false, error: `执行查询失败: ${result}` }
       }
       const jsonStr = this.decodeJsonPtr(outPtr[0])
       if (!jsonStr) return { success: false, error: '解析查询结果失败' }
       const rows = JSON.parse(jsonStr)
+      if (isContactQuery) {
+        const count = Array.isArray(rows) ? rows.length : -1
+        this.writeLog(`[diag:execQuery] contact query ok rows=${count} kind=${kind} path=${effectivePath} sql="${this.formatSqlForLog(sql)}"`, true)
+      }
       return { success: true, rows }
     } catch (e) {
+      const isContactQuery = String(kind).toLowerCase() === 'contact' || /\bfrom\s+contact\b/i.test(String(sql))
+      if (isContactQuery) {
+        this.writeLog(`[diag:execQuery] contact query exception kind=${kind} path=${path || ''} sql="${this.formatSqlForLog(sql)}" err=${String(e)}`, true)
+        await this.dumpDbStatus('execQuery-contact-exception')
+      }
       return { success: false, error: String(e) }
     }
   }
