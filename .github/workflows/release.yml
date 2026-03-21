@@ -163,7 +163,7 @@ jobs:
           WF_SIGN_PRIVATE_KEY: ${{ secrets.WF_SIGN_PRIVATE_KEY }}
           WF_SIGNING_REQUIRED: "1"
         run: |
-          npx electron-builder --win nsis --arm64 --publish always
+          npx electron-builder --win nsis --arm64 --publish always --config.artifactName="${productName}-${version}-arm64-Setup.${ext}"
 
   update-release-notes:
     runs-on: ubuntu-latest
@@ -192,7 +192,7 @@ jobs:
             echo "$ASSETS_JSON" | jq -r --arg p "$pattern" '[.assets[].name | select(test($p))][0] // ""'
           }
 
-          WINDOWS_ASSET="$(pick_asset "\\.exe$")"
+          WINDOWS_ASSET="$(echo "$ASSETS_JSON" | jq -r '[.assets[].name | select(test("\\.exe$")) | select(test("arm64") | not)][0] // ""')"
           WINDOWS_ARM64_ASSET="$(echo "$ASSETS_JSON" | jq -r '[.assets[].name | select(test("arm64.*\\.exe$"))][0] // ""')"
           MAC_ASSET="$(pick_asset "\\.dmg$")"
           LINUX_DEB_ASSET="$(pick_asset "\\.deb$")"
