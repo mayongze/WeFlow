@@ -225,6 +225,8 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [isTestingInsight, setIsTestingInsight] = useState(false)
   const [insightTestResult, setInsightTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [showInsightApiKey, setShowInsightApiKey] = useState(false)
+  const [isTriggeringInsightTest, setIsTriggeringInsightTest] = useState(false)
+  const [insightTriggerResult, setInsightTriggerResult] = useState<{ success: boolean; message: string } | null>(null)
   const [aiInsightWhitelistEnabled, setAiInsightWhitelistEnabled] = useState(false)
   const [aiInsightWhitelist, setAiInsightWhitelist] = useState<Set<string>>(new Set())
   const [insightWhitelistSearch, setInsightWhitelistSearch] = useState('')
@@ -2609,26 +2611,65 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         />
       </div>
 
-      {/* 测试连接 */}
+      {/* 测试连接 + 触发测试 */}
       <div className="form-group">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-          <button
-            className="btn btn-secondary"
-            onClick={handleTestInsightConnection}
-            disabled={isTestingInsight || !aiInsightApiBaseUrl || !aiInsightApiKey}
-          >
-            {isTestingInsight ? (
-              <><Loader2 size={14} style={{ marginRight: 4, animation: 'spin 1s linear infinite' }} /> 测试中...</>
-            ) : (
-              <>测试 API 连接</>
+        <label>调试工具</label>
+        <span className="form-hint">
+          先用"测试 API 连接"确认 Key 和 URL 填写正确，再用"立即触发测试见解"验证完整链路（数据库→API→弹窗）。触发后请留意右下角通知弹窗。
+        </span>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '10px' }}>
+          {/* 测试 API 连接 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <button
+              className="btn btn-secondary"
+              onClick={handleTestInsightConnection}
+              disabled={isTestingInsight || !aiInsightApiBaseUrl || !aiInsightApiKey}
+            >
+              {isTestingInsight ? (
+                <><Loader2 size={14} style={{ marginRight: 4, animation: 'spin 1s linear infinite' }} />测试中...</>
+              ) : (
+                <>测试 API 连接</>
+              )}
+            </button>
+            {insightTestResult && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: insightTestResult.success ? 'var(--color-success, #22c55e)' : 'var(--color-danger, #ef4444)' }}>
+                {insightTestResult.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+                {insightTestResult.message}
+              </span>
             )}
-          </button>
-          {insightTestResult && (
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: insightTestResult.success ? 'var(--color-success, #22c55e)' : 'var(--color-danger, #ef4444)' }}>
-              {insightTestResult.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
-              {insightTestResult.message}
-            </span>
-          )}
+          </div>
+          {/* 触发测试见解 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <button
+              className="btn btn-secondary"
+              onClick={async () => {
+                setIsTriggeringInsightTest(true)
+                setInsightTriggerResult(null)
+                try {
+                  const result = await (window.electronAPI as any).insight.triggerTest()
+                  setInsightTriggerResult(result)
+                } catch (e: any) {
+                  setInsightTriggerResult({ success: false, message: `调用失败：${e?.message || String(e)}` })
+                } finally {
+                  setIsTriggeringInsightTest(false)
+                }
+              }}
+              disabled={isTriggeringInsightTest || !aiInsightEnabled || !aiInsightApiBaseUrl || !aiInsightApiKey}
+              title={!aiInsightEnabled ? '请先开启 AI 见解总开关' : ''}
+            >
+              {isTriggeringInsightTest ? (
+                <><Loader2 size={14} style={{ marginRight: 4, animation: 'spin 1s linear infinite' }} />触发中...</>
+              ) : (
+                <>立即触发测试见解</>
+              )}
+            </button>
+            {insightTriggerResult && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: insightTriggerResult.success ? 'var(--color-success, #22c55e)' : 'var(--color-danger, #ef4444)' }}>
+                {insightTriggerResult.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+                {insightTriggerResult.message}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -2879,7 +2920,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             <p className="api-desc" style={{ lineHeight: 1.7 }}>
               <strong>触发方式一：活跃会话分析</strong> — 每当微信数据库变化（即你收到新消息）时，经过 500ms 防抖后，对最近活跃的私聊会话进行分析。<br />
               <strong>触发方式二：沉默扫描</strong> — 每 4 小时独立扫描一次，对超过阈值天数无消息的联系人发出提醒。<br />
-              <strong>时间观念</strong> — 每次调用时，AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
+              <strong>时间观念</strong> — 每次调用时��AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
               <strong>隐私</strong> — 所有分析请求均直接从你的电脑发往你填写的 API 地址，不经过任何 WeFlow 服务器。
             </p>
           </div>
@@ -3123,7 +3164,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     try {
       const verifyResult = await window.electronAPI.auth.hello('请验证您的身份以开启 Windows Hello')
       if (!verifyResult.success) {
-        showMessage(verifyResult.error || 'Windows Hello 验证失败', false)
+        showMessage(verifyResult.error || 'Windows Hello ��证失败', false)
         return
       }
 

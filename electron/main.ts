@@ -1404,6 +1404,10 @@ function registerIpcHandlers() {
     return insightService.getTodayStats()
   })
 
+  ipcMain.handle('insight:triggerTest', async () => {
+    return insightService.triggerTest()
+  })
+
   ipcMain.handle('config:clear', async () => {
     if (isLaunchAtStartupSupported() && getSystemLaunchAtStartup()) {
       const result = setSystemLaunchAtStartup(false)

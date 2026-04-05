@@ -447,6 +447,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // AI 见解
   insight: {
     testConnection: () => ipcRenderer.invoke('insight:testConnection'),
-    getTodayStats: () => ipcRenderer.invoke('insight:getTodayStats')
+    getTodayStats: () => ipcRenderer.invoke('insight:getTodayStats'),
+    triggerTest: () => ipcRenderer.invoke('insight:triggerTest')
   }
 })
