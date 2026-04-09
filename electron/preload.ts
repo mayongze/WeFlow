@@ -19,6 +19,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onShow: (callback: (event: any, data: any) => void) => {
       ipcRenderer.on('notification:show', callback)
       return () => ipcRenderer.removeAllListeners('notification:show')
+    }, // 监听原本发送出来的navigate-to-session事件，跳转到具体的会话
+    onNavigateToSession: (callback: (sessionId: string) => void) => {
+      const listener = (_: any, sessionId: string) => callback(sessionId)
+      ipcRenderer.on('navigate-to-session', listener)
+      return () => ipcRenderer.removeListener('navigate-to-session', listener)
     }
   },
 
@@ -66,7 +71,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('app:updateAvailable', (_, info) => callback(info))
       return () => ipcRenderer.removeAllListeners('app:updateAvailable')
     },
-    checkWayland: () => ipcRenderer.invoke('app:checkWayland'),
   },
 
   // 日志
@@ -266,15 +270,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   image: {
     decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) =>
       ipcRenderer.invoke('image:decrypt', payload),
-    resolveCache: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; disableUpdateCheck?: boolean }) =>
+    resolveCache: (payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      disableUpdateCheck?: boolean
+      allowCacheIndex?: boolean
+    }) =>
       ipcRenderer.invoke('image:resolveCache', payload),
     resolveCacheBatch: (
       payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean }
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
     ) => ipcRenderer.invoke('image:resolveCacheBatch', payloads, options),
     preload: (
       payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { allowDecrypt?: boolean }
+      options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => ipcRenderer.invoke('image:preload', payloads, options),
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => {
       const listener = (_: unknown, payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => callback(payload)
@@ -492,5 +502,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     start: (port?: number, host?: string) => ipcRenderer.invoke('http:start', port, host),
     stop: () => ipcRenderer.invoke('http:stop'),
     status: () => ipcRenderer.invoke('http:status')
+  },
+
+  // AI 见解
+  insight: {
+    testConnection: () => ipcRenderer.invoke('insight:testConnection'),
+    getTodayStats: () => ipcRenderer.invoke('insight:getTodayStats'),
+    triggerTest: () => ipcRenderer.invoke('insight:triggerTest')
   }
 })

@@ -30,6 +30,7 @@ import { cloudControlService } from './services/cloudControlService'
 import { destroyNotificationWindow, registerNotificationHandlers, showNotification, setNotificationNavigateHandler } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
 import { messagePushService } from './services/messagePushService'
+import { insightService } from './services/insightService'
 import { bizService } from './services/bizService'
 
 // 配置自动更新
@@ -181,7 +182,6 @@ const applyAutoUpdateChannel = (reason: 'startup' | 'settings' = 'startup') => {
   autoUpdater.channel = nextUpdaterChannel
   lastAppliedUpdaterChannel = nextUpdaterChannel
   lastAppliedUpdaterFeedUrl = nextFeedUrl
-  console.log(`[Update](${reason}) 当前版本 ${appVersion}，当前轨道: ${currentTrack}，渠道偏好: ${track}，更新通道: ${autoUpdater.channel}，feed=${nextFeedUrl}，allowDowngrade=${autoUpdater.allowDowngrade}`)
 }
 
 applyAutoUpdateChannel('startup')
@@ -1618,7 +1618,21 @@ function registerIpcHandlers() {
       applyAutoUpdateChannel('settings')
     }
     void messagePushService.handleConfigChanged(key)
+    void insightService.handleConfigChanged(key)
     return result
+  })
+
+  // AI 见解
+  ipcMain.handle('insight:testConnection', async () => {
+    return insightService.testConnection()
+  })
+
+  ipcMain.handle('insight:getTodayStats', async () => {
+    return insightService.getTodayStats()
+  })
+
+  ipcMain.handle('insight:triggerTest', async () => {
+    return insightService.triggerTest()
   })
 
   ipcMain.handle('config:clear', async () => {
@@ -1630,6 +1644,7 @@ function registerIpcHandlers() {
     }
     configService?.clear()
     messagePushService.handleConfigCleared()
+    insightService.handleConfigCleared()
     return true
   })
 
@@ -1676,13 +1691,6 @@ function registerIpcHandlers() {
 
   ipcMain.handle('app:setLaunchAtStartup', async (_, enabled: boolean) => {
     return applyLaunchAtStartupPreference(enabled === true)
-  })
-
-  ipcMain.handle('app:checkWayland', async () => {
-    if (process.platform !== 'linux') return false;
-
-    const sessionType = process.env.XDG_SESSION_TYPE?.toLowerCase();
-    return Boolean(process.env.WAYLAND_DISPLAY || sessionType === 'wayland');
   })
 
   ipcMain.handle('log:getPath', async () => {
@@ -2558,7 +2566,13 @@ function registerIpcHandlers() {
   ipcMain.handle('image:decrypt', async (_, payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => {
     return imageDecryptService.decryptImage(payload)
   })
-  ipcMain.handle('image:resolveCache', async (_, payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; disableUpdateCheck?: boolean }) => {
+  ipcMain.handle('image:resolveCache', async (_, payload: {
+    sessionId?: string
+    imageMd5?: string
+    imageDatName?: string
+    disableUpdateCheck?: boolean
+    allowCacheIndex?: boolean
+  }) => {
     return imageDecryptService.resolveCachedImage(payload)
   })
   ipcMain.handle(
@@ -2566,13 +2580,14 @@ function registerIpcHandlers() {
     async (
       _,
       payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { disableUpdateCheck?: boolean }
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
     ) => {
       const list = Array.isArray(payloads) ? payloads : []
       const rows = await Promise.all(list.map(async (payload) => {
         return imageDecryptService.resolveCachedImage({
           ...payload,
-          disableUpdateCheck: options?.disableUpdateCheck === true
+          disableUpdateCheck: options?.disableUpdateCheck === true,
+          allowCacheIndex: options?.allowCacheIndex !== false
         })
       }))
       return { success: true, rows }
@@ -2583,7 +2598,7 @@ function registerIpcHandlers() {
     async (
       _,
       payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
-      options?: { allowDecrypt?: boolean }
+      options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
     ) => {
     imagePreloadService.enqueue(payloads || [], options)
     return true
@@ -3478,8 +3493,10 @@ app.whenReady().then(async () => {
   registerIpcHandlers()
   chatService.addDbMonitorListener((type, json) => {
     messagePushService.handleDbMonitorChange(type, json)
+    insightService.handleDbMonitorChange(type, json)
   })
   messagePushService.start()
+  insightService.start()
   await delay(200)
 
   // 检查配置状态
@@ -3600,6 +3617,7 @@ app.on('before-quit', async () => {
   if (tray) { try { tray.destroy() } catch {} tray = null }
   // 通知窗使用 hide 而非 close，退出时主动销毁，避免残留窗口阻塞进程退出。
   destroyNotificationWindow()
+  insightService.stop()
   // 兜底：5秒后强制退出，防止某个异步任务卡住导致进程残留
   const forceExitTimer = setTimeout(() => {
     console.warn('[App] Force exit after timeout')
